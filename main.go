@@ -181,7 +181,7 @@ func init() {
 	pflag.String("api-key", "", "Redis Cloud API Key")
 	pflag.String("secret-key", "", "Redis Cloud Secret Key")
 
-	pflag.Bool("system", true, "fetch the system log")
+	pflag.Bool("system", false, "fetch the system log")
 	pflag.Bool("session", false, "fetch the sesssion log")
 
 	pflag.Bool("append", false, "append to the output file (if not standard output)")
