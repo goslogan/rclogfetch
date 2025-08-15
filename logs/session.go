@@ -4,7 +4,6 @@ import (
 	"io"
 	"os"
 	"slices"
-	"sort"
 	"time"
 
 	"github.com/spf13/viper"
@@ -26,10 +25,10 @@ type SessionLogs struct {
 	Entries []SessionLogEntry `json:"entries"`
 }
 
-// MergeResponses appends the contents of a SessionLogEntries value into the current one, returning
+// merge appends the contents of a SessionLogEntries value into the current one, returning
 // e new value with the content of both. This identifies entries that overlap by looking for a
-// matching Id field.
-func (logs *SessionLogs) Merge(second *SessionLogs) {
+// matching Id field. See filter for why we can't do a binary search here
+func (logs *SessionLogs) merge(second *SessionLogs) {
 
 	// simple cases
 	if len(logs.Entries) == 0 {
@@ -41,9 +40,12 @@ func (logs *SessionLogs) Merge(second *SessionLogs) {
 		return
 	}
 
-	// Find the last id in the first list anywhere in the last list.
-	n := sort.Search(len(logs.Entries), func(x int) bool { return logs.Entries[x].Id == second.Entries[0].Id })
-	logs.Entries = append(logs.Entries[0:n], second.Entries...)
+	for n := 0; n < len(logs.Entries); n++ {
+		if logs.Entries[n].Id == second.Entries[0].Id {
+			logs.Entries = append(logs.Entries[0:n], second.Entries...)
+			return
+		}
+	}
 }
 
 // Sort returns the SystemLogEntries value in the required order (sorts in place by time)
@@ -63,16 +65,20 @@ func (logs *SessionLogs) Sort(asAsc bool) {
 }
 
 // filter a log response so that only responses newer than the previous limit are contained.
+// Remember -logs are returned in time order, reversed. We can just walk through and look
+// for the id. But we can't use a binary search in the session log because we are looking for
+// a GUID.
 // Returns whether or not the stopId was found in the response
-func (logs *SessionLogs) Filter() bool {
+func (logs *SessionLogs) filter() bool {
 
-	n := sort.Search(len(logs.Entries), func(x int) bool { return logs.Entries[x].Id <= logs.lastId })
-	if n == len(logs.Entries) {
-		return false
-	} else {
-		logs.Entries = logs.Entries[0:n]
-		return true
+	for n := 0; n < len(logs.Entries); n++ {
+		if logs.Entries[n].Id == logs.lastId {
+			logs.Entries = logs.Entries[0:n]
+			return true
+		}
 	}
+
+	return false
 }
 
 // serializeResults writes the retrieved logs to output either as a JSON array if JSON output is requested
@@ -116,8 +122,6 @@ func (logs *SessionLogs) FetchLogs(config *viper.Viper) error {
 
 	offset := uint32(0)
 
-	responses := &SessionLogs{}
-
 	for {
 		resp, err := makeRequest(config, offset, count)
 		if err != nil {
@@ -131,8 +135,8 @@ func (logs *SessionLogs) FetchLogs(config *viper.Viper) error {
 			return err
 		}
 
-		found := nextResponse.Filter()
-		responses.Merge(nextResponse)
+		found := nextResponse.filter()
+		logs.merge(nextResponse)
 
 		if found || len(nextResponse.Entries) == 0 {
 			return nil

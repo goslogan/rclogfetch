@@ -12,7 +12,7 @@ import (
 )
 
 const baseURL = "https://api.redislabs.com/v1/%s"
-const count = 500
+const count = 100
 
 type LogHandler interface {
 	Sort(asAsc bool)
