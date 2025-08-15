@@ -31,4 +31,4 @@ The command line arguments can be read from a configuration file (.rclogfetch.ya
 
 ## Note
 
-There is a theoretical chance that log entries could be missed if and only if the log is filling at a faster rate than the program can process the logs and call the REST API. The API fetches 100 entries at a time from the log until it finds an entry that it has already retrieved. If 501 new entries are added between calls the first new entry would be lost. However, this is a log file that is filled on human driven actions. More than ten entries in a minute is extraordinarily unlikely.
+There is a very small chance that log entries could be missed if and only if the log is filling at a faster rate than the program can process the logs and call the REST API. The API fetches 100 entries at a time from the log until it finds an entry that it has already retrieved. If 501 new entries are added between calls the first new entry would be lost. However, this is a log file that is filled on human driven actions. More than ten entries in a minute is extraordinarily unlikely.
