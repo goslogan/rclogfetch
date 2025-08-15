@@ -1,38 +1,17 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
-	"slices"
-	"sort"
-	"time"
+	"strconv"
 
-	"github.com/gocarina/gocsv"
+	"github.com/goslogan/rclogfetch/logs"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 )
 
-type SystemLogEntry struct {
-	Id          uint32    `json:"id" csv:"id"`
-	TimeStamp   time.Time `json:"time" csv:"time"`
-	Originator  string    `json:"originator,omitempty" csv:"originator"`
-	ApiKeyName  string    `json:"apiKeyName,omitempty" csv:"apiKeyName"`
-	Resource    string    `json:"resource,omitempty" csv:"resource"`
-	Type        string    `json:"type,omitempty" csv:"type"`
-	Description string    `json:"description" csv:"description"`
-}
-
-type LogResponse struct {
-	Entries []SystemLogEntry `json:"entries"`
-}
-
 var config, stateConfig *viper.Viper
-
-const baseURL = "https://api.redislabs.com/v1/%s"
 
 func main() {
 
@@ -53,35 +32,61 @@ func main() {
 	}
 
 	// Get the output writer
-	output, err := getOUtput()
+	output, err := getOutput()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "unable to open output file %s: %v", config.GetString("output"), err)
 		os.Exit(1)
 	}
 
-	// finalId will contain the ID of the last log entry fetched, which will be used to update the state file
-	results, err := fetchLogs(stateConfig.GetUint32("id"))
+	var handler logs.LogHandler
+
+	if config.GetBool("system") {
+		handler = &logs.SystemLogs{}
+		handler.SetStopId(stateConfig.GetUint32("system"))
+	} else {
+		handler = &logs.SessionLogs{}
+		handler.SetStopId(stateConfig.GetString("session"))
+	}
+
+	err = handler.FetchLogs(config)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Error fetching logs: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 
-	if len(results) > 0 {
-		stateConfig.Set("id", results[0].Id)
-		if err := stateConfig.WriteConfig(); err != nil {
+	// need to call before sorting.
+	finalId := handler.GetStopId()
+
+	handler.Sort(config.GetBool("asc"))
+	err = handler.Serialize(output, config.GetBool("json"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Error serializing logs: %v\n", err)
+		os.Exit(1)
+	}
+
+	if handler.Size() > 0 {
+		err = saveState(finalId)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", os.Args[0])
-			fmt.Fprintf(os.Stderr, "Error writing new final state id (%d): %v\n", results[0].Id, err)
-			os.Exit(1)
-		}
-		if err := serializeResults(output, sortResponse(results)); err != nil {
-			fmt.Fprintf(os.Stderr, "%s\n", os.Args[0])
-			fmt.Fprintf(os.Stderr, "Error serializing logs: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error saving state: %v\n", err)
 			os.Exit(1)
 		}
 	}
 
+}
+
+// saveState writes the state file back again after a succesful log fetch
+func saveState(finalId any) error {
+	if config.GetBool("system") {
+		stateConfig.Set("system", finalId)
+	} else {
+		stateConfig.Set("session", finalId)
+	}
+
+	return stateConfig.WriteConfig()
 }
 
 // loadState loads the state file into the viper config if found, checking the sanity of the
@@ -104,8 +109,16 @@ func loadState() error {
 	}
 
 	// If overridden on the command line, update here
-	if config.IsSet("id") {
-		stateConfig.Set("id", config.GetUint32("id"))
+	if config.IsSet("last-id") {
+		if config.GetBool("system") {
+			val, err := strconv.ParseUint(config.GetString("last-id"), 10, 32)
+			if err != nil {
+				return fmt.Errorf("invalid last-id value %s: %v", config.GetString("last-id"), err)
+			}
+			stateConfig.Set("system", val)
+		} else {
+			stateConfig.Set("session", config.GetString("last-id"))
+		}
 	}
 
 	return nil
@@ -145,7 +158,7 @@ func validateFlags() error {
 // getOutput returns the io.writer that the output should be written to.
 // By default this is stdout. If another file is specified, it will be created/truncated unless
 // the --append flag has been set.
-func getOUtput() (*os.File, error) {
+func getOutput() (*os.File, error) {
 
 	if config.GetString("output") == "" {
 		return os.Stdout, nil
@@ -163,143 +176,6 @@ func getOUtput() (*os.File, error) {
 	return output, err
 }
 
-// fetchLogs call the Redis Cloud API to fetch the logs, starting from the given offset until a log
-// containg stopId is found or the end of the log is reached.
-func fetchLogs(stopId uint32) ([]SystemLogEntry, error) {
-
-	var url string
-	responses := []SystemLogEntry{}
-
-	if config.GetBool("system") {
-		url = fmt.Sprintf(baseURL, "logs")
-	} else {
-		url = fmt.Sprintf(baseURL, "session-logs")
-	}
-
-	offset := uint32(0)
-	count := config.GetUint32("count")
-	for {
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("x-api-key", config.GetString("api-key"))
-		req.Header.Set("x-api-secret-key", config.GetString("secret-key"))
-
-		q := req.URL.Query()
-		q.Set("offset", fmt.Sprintf("%d", offset))
-		q.Set("count", fmt.Sprintf("%d", count))
-		req.URL.RawQuery = q.Encode()
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-
-		if resp.StatusCode == http.StatusUnauthorized {
-			return nil, fmt.Errorf("unauthorized: check your API key and secret key")
-		} else if resp.StatusCode == http.StatusForbidden {
-			return nil, fmt.Errorf("forbidden: check your API key and secret key")
-		} else if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("unexpected status code %d from API", resp.StatusCode)
-		}
-
-		logResponse, err := parseBody(resp.Body)
-		if err != nil {
-			return nil, err
-		}
-
-		logResponse, found := filterResponse(logResponse, stopId)
-		responses = mergeResponses(responses, logResponse)
-
-		if found || len(logResponse) == 0 {
-			return responses, nil
-		} else {
-			offset += count
-		}
-
-	}
-}
-
-// mergeResponses takes two SystemLogEntry slices and merges them such that no
-// duplicate entries are found. It's assumed that the first slice contains higher
-// (in the sense of higher Id value) entries than the second.
-func mergeResponses(first []SystemLogEntry, second []SystemLogEntry) []SystemLogEntry {
-
-	// simple cases
-	if len(first) == 0 {
-		return second
-	}
-
-	if len(second) == 0 {
-		return first
-	}
-
-	if first[len(first)-1].Id > second[0].Id {
-		return append(first, second...)
-	}
-
-	n := sort.Search(len(first), func(x int) bool { return first[x].Id <= second[0].Id })
-	return append(first[0:n], second...)
-}
-
-// sortResponse ensures the response returned is in the correct order
-func sortResponse(response []SystemLogEntry) []SystemLogEntry {
-
-	if viper.GetBool("asc") {
-		slices.SortFunc(response, func(a SystemLogEntry, b SystemLogEntry) int {
-			if a.Id > b.Id {
-				return 1
-			} else if b.Id > a.Id {
-				return -1
-			} else {
-				return 0
-			}
-		})
-	}
-	return response
-}
-
-// parse the body and return any records where the id is greater than the one passed in.
-func parseBody(body io.Reader) ([]SystemLogEntry, error) {
-
-	var logResponse LogResponse
-
-	if content, err := io.ReadAll(body); err != nil {
-		return nil, err
-	} else if err := json.Unmarshal(content, &logResponse); err != nil {
-		return nil, err
-	} else {
-		return logResponse.Entries, nil
-	}
-
-}
-
-// filter a log response so that only responses newer than the previous limit are contained.
-// Returns whether or not the stopId was found in the response and a new filtered response.
-func filterResponse(response []SystemLogEntry, stopId uint32) ([]SystemLogEntry, bool) {
-
-	n := sort.Search(len(response), func(x int) bool { return response[x].Id <= stopId })
-	if n == len(response) {
-		return response, false
-	} else {
-		return response[0:n], true
-	}
-
-}
-
-// serializeResults writes the retrieved logs to output either as a JSON array if JSON output is requested
-// or as CSV if that was requested
-func serializeResults(out *os.File, results []SystemLogEntry) error {
-	if config.GetBool("json") {
-		encoder := json.NewEncoder(out)
-		encoder.SetIndent("", "  ")
-		return encoder.Encode(results)
-	} else {
-		return gocsv.MarshalFile(results, out) // csv
-	}
-}
-
 func init() {
 
 	pflag.String("api-key", "", "Redis Cloud API Key")
@@ -311,8 +187,7 @@ func init() {
 	pflag.Bool("append", false, "append to the output file (if not standard output)")
 	pflag.String("output", "", "output file (default is standard output)")
 
-	pflag.Uint32("id", 0, "id of the last recored received (used to resume fetching logs)")
-	pflag.Uint32("count", 1000, "number of lines to fetch from the log (maximum 1000)")
+	pflag.String("last-id", "", "id of the last recored received (used to resume fetching logs)")
 
 	pflag.String("statefile", ".rc-log-fetch-state.yaml", "state file to store the last fetched log line id")
 
